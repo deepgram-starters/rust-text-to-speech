@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/rust-text-to-speech"
 useCase = "text-to-speech"
 language = "rust"
 framework = "axum"
-sdk = "N/A"
+sdk = "deepgram"
 tags = ["text-to-speech", "tts", "audio-generation", "rust", "axum"]
 
 [install.pre]

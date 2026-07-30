@@ -22,6 +22,11 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use deepgram::{
+    speak::options::{Model, Options},
+    Deepgram, DeepgramError,
+};
+use futures_util::StreamExt;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -288,42 +293,38 @@ fn format_error_response(
 // DEEPGRAM API - Direct HTTP calls to the Deepgram TTS endpoint
 // ============================================================================
 
-/// Call the Deepgram TTS API directly and return the audio bytes.
-/// Sends a JSON body with the text and passes the model as a query parameter.
+/// Call the Deepgram TTS API via the official `deepgram` crate and return the
+/// audio bytes.
+///
+/// Uses the batch (REST) speak endpoint through `speak_to_stream`, collecting
+/// the streamed audio chunks into a single buffer. No `encoding`/`container`
+/// options are set, so Deepgram returns its default MP3 output, preserving the
+/// `audio/mpeg` content type the frontend expects.
 async fn generate_audio(api_key: &str, text: &str, model: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::new();
+    let dg = Deepgram::new(api_key).map_err(|e| format!("failed to init Deepgram client: {}", e))?;
 
-    let url = format!("https://api.deepgram.com/v1/speak?model={}", model);
+    let options = Options::builder()
+        .model(Model::CustomId(model.to_string()))
+        .build();
 
-    let mut payload = HashMap::new();
-    payload.insert("text", text);
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Token {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    let audio_stream = dg
+        .text_to_speech()
+        .speak_to_stream(text, &options)
         .await
-        .map_err(|e| format!("failed to call Deepgram API: {}", e))?;
+        .map_err(|e| match &e {
+            // Surface the API error body so downstream error-code mapping
+            // (MODEL_NOT_FOUND, TEXT_TOO_LONG, ...) keeps working.
+            DeepgramError::DeepgramApiError { body, .. } => body.clone(),
+            other => other.to_string(),
+        })?;
 
-    let status = resp.status();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read response: {}", e))?;
-
-    if !status.is_success() {
-        let body_str = String::from_utf8_lossy(&body);
-        return Err(format!(
-            "Deepgram API error (status {}): {}",
-            status.as_u16(),
-            body_str
-        ));
+    let mut audio = Vec::new();
+    let mut audio_stream = std::pin::pin!(audio_stream);
+    while let Some(chunk) = audio_stream.next().await {
+        audio.extend_from_slice(&chunk);
     }
 
-    Ok(body.to_vec())
+    Ok(audio)
 }
 
 // ============================================================================
