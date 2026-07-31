@@ -307,24 +307,35 @@ async fn generate_audio(api_key: &str, text: &str, model: &str) -> Result<Vec<u8
         .model(Model::CustomId(model.to_string()))
         .build();
 
-    let audio_stream = dg
-        .text_to_speech()
-        .speak_to_stream(text, &options)
-        .await
-        .map_err(|e| match &e {
-            // Surface the API error body so downstream error-code mapping
-            // (MODEL_NOT_FOUND, TEXT_TOO_LONG, ...) keeps working.
-            DeepgramError::DeepgramApiError { body, .. } => body.clone(),
-            other => other.to_string(),
-        })?;
+    // Bound the whole TTS request+stream with a timeout so a slow or stalled
+    // Deepgram response can't block the handler forever. The deepgram 0.10
+    // client sets no request timeout and exposes no way to inject a custom
+    // reqwest client, so wrap the call ourselves (was a 30s timeout on the old
+    // direct-HTTP path).
+    let fetch = async {
+        let audio_stream = dg
+            .text_to_speech()
+            .speak_to_stream(text, &options)
+            .await
+            .map_err(|e| match &e {
+                // Surface the API error body so downstream error-code mapping
+                // (MODEL_NOT_FOUND, TEXT_TOO_LONG, ...) keeps working.
+                DeepgramError::DeepgramApiError { body, .. } => body.clone(),
+                other => other.to_string(),
+            })?;
 
-    let mut audio = Vec::new();
-    let mut audio_stream = std::pin::pin!(audio_stream);
-    while let Some(chunk) = audio_stream.next().await {
-        audio.extend_from_slice(&chunk);
+        let mut audio = Vec::new();
+        let mut audio_stream = std::pin::pin!(audio_stream);
+        while let Some(chunk) = audio_stream.next().await {
+            audio.extend_from_slice(&chunk);
+        }
+        Ok::<Vec<u8>, String>(audio)
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), fetch).await {
+        Ok(result) => result,
+        Err(_) => Err("Deepgram request timed out after 30s".to_string()),
     }
-
-    Ok(audio)
 }
 
 // ============================================================================
